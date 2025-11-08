@@ -10,37 +10,35 @@
 #         * vidstabdetect per file -> work/trf/*.trf  (FULL file, no trimming)
 #     - Build plan.csv / plan.json with GLOBAL timeline:
 #         index,file,transform,duration,start,end
-#       where start/end are seconds from the beginning of the shooting.
+#       where start/end are seconds from the beginning of shooting.
 #       With --from/--dur only overlapping files are included,
-#       but start/end stay global (no renormalization).
+#       but start/end stay global.
 #
 #   render <work_dir> <output_mp4> [--from HH:MM:SS] [--dur SECS]
-#     - Read plan.csv
-#     - Interpret --from/--dur in SAME coordinates as plan.csv (global timeline)
-#     - For each segment in that window:
+#     - Read plan.csv (global timeline)
+#     - --from/--dur are in same global coords
+#     - For each segment:
 #         trim -> vidstabtransform -> unsharp -> optional scale
 #         audio -> mono 48k
 #     - Concatenate, add watermark once, encode H.264/H.265.
 #
 #   debug <input_dir> <work_dir> <split_output_mp4> [--from HH:MM:SS] [--dur SECS]
-#     - Fast, self-contained test on a window (no dependency on plan.csv):
-#         * only overlapping fragments
-#         * per-fragment vidstabdetect (window only) -> .debug.trf
+#     - Self-contained test on a window (no plan.csv):
+#         * find overlapping fragments
+#         * vidstabdetect on that window only -> *.debug.trf
 #         * outputs:
 #             1) split_output_mp4         : split-screen (left=orig, right=stab, with logo)
 #             2) split_output_mp4_orig    : original-only
 #             3) split_output_mp4_stab    : stabilized-only
 #
-# Safety:
-#   - set -euo pipefail: fail fast.
-#   - No eval on user input; only controlled key=value from our own builders.
-#   - Handles spaces in paths.
+# All code & comments in English.
 # ===============================================================
 
 set -euo pipefail
 export LC_ALL=C
 
 # =================== Configuration (env overrides) ===================
+
 # PNG watermark path (recommend ~200–400px wide, non-HDR)
 LOGO="${LOGO:-/home/arezvov/Pictures/funkcio-title.png}"
 
@@ -54,7 +52,7 @@ ACCURACY="${ACCURACY:-15}"
 SMOOTH="${SMOOTH:-35}"
 
 # vidstabtransform: auto zoom to hide borders; 3–8 typical
-ZOOM="${ZOOM:-5}"
+ZOOM="${ZOOM:-1}"
 
 # Post-stabilization unsharp filter; reduce if footage is noisy
 UNSHARP="${UNSHARP:-5:5:0.8:3:3:0.4}"
@@ -177,25 +175,89 @@ encode_args() {
   esac
 }
 
+# =================== Common helper functions ===================
+
+# Parse --from/--dur arguments
+# Returns via stdout: WINDOWED WIN_FROM WIN_DUR WIN_TO
+parse_window_args() {
+  local WINDOWED=0 WIN_FROM="" WIN_DUR="" WIN_TO=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from) WIN_FROM="$(to_seconds "$2")"; WINDOWED=1; shift 2;;
+      --dur)  WIN_DUR="$(to_seconds "$2")";  WINDOWED=1; shift 2;;
+      *) fatal "Unknown window arg: $1";;
+    esac
+  done
+  if [[ "$WINDOWED" -eq 1 ]]; then
+    [[ -n "$WIN_FROM" && -n "$WIN_DUR" ]] || fatal "Both --from and --dur are required in window mode"
+    WIN_TO="$(float_add "$WIN_FROM" "$WIN_DUR")"
+  fi
+  printf 'WINDOWED=%s\n' "$WINDOWED"
+  printf 'WIN_FROM=%s\n' "$WIN_FROM"
+  printf 'WIN_DUR=%s\n' "$WIN_DUR"
+  printf 'WIN_TO=%s\n' "$WIN_TO"
+}
+
+# Calculate overlap between file and window
+# Args: file_start file_end window_start window_end
+# Returns via stdout: OVERLAP_START OVERLAP_END OVERLAP_DUR LOCAL_START HAS_OVERLAP
+calculate_window_overlap() {
+  local fstart="$1" fend="$2" wstart="$3" wend="$4"
+  local os oe od ls has_overlap=0
+  
+  os=$(float_max "$fstart" "$wstart")
+  oe=$(float_min "$fend" "$wend")
+  od=$(float_sub "$oe" "$os")
+  ls=$(float_sub "$os" "$fstart")
+  
+  if float_gt "$od" "0.000001"; then
+    has_overlap=1
+  fi
+  
+  printf 'OVERLAP_START=%s\n' "$os"
+  printf 'OVERLAP_END=%s\n' "$oe"
+  printf 'OVERLAP_DUR=%s\n' "$od"
+  printf 'LOCAL_START=%s\n' "$ls"
+  printf 'HAS_OVERLAP=%s\n' "$has_overlap"
+}
+
+# Run vidstabdetect on FULL file (no trimming)
+run_vidstabdetect_full() {
+  local input_file="$1" trf_file="$2"
+  ffmpeg -hide_banner -nostdin -stats -loglevel info -progress pipe:2 \
+    -fflags +genpts+discardcorrupt -err_detect ignore_err \
+    -i "$input_file" \
+    -vf "vidstabdetect=shakiness=${SHAKINESS}:accuracy=${ACCURACY}:result=${trf_file}" \
+    -f null - >/dev/null
+}
+
+# Run vidstabdetect on window only (with -ss/-t trim)
+run_vidstabdetect_window() {
+  local input_file="$1" trf_file="$2" start_time="$3" duration="$4"
+  ffmpeg -hide_banner -nostdin -stats -loglevel info -progress pipe:2 \
+    -fflags +genpts+discardcorrupt -err_detect ignore_err \
+    -ss "$start_time" -t "$duration" \
+    -i "$input_file" \
+    -vf "vidstabdetect=shakiness=${SHAKINESS}:accuracy=${ACCURACY}:result=${trf_file}" \
+    -f null - >/dev/null
+}
+
 # =================== analyze ===================
 cmd_analyze() {
   local in_dir="$1" work="$2"; shift 2
   ensure_tools
   mkdir -p "${work}/${TRF_DIRNAME}"
 
-  local WINDOWED=0 WIN_FROM WIN_DUR WIN_TO
-  WIN_FROM=""; WIN_DUR=""; WIN_TO=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --from) WIN_FROM="$(to_seconds "$2")"; WINDOWED=1; shift 2;;
-      --dur)  WIN_DUR="$(to_seconds "$2")";  WINDOWED=1; shift 2;;
-      *) fatal "Unknown arg for analyze: $1";;
+  local WINDOWED WIN_FROM WIN_DUR WIN_TO
+  local win_info
+  win_info="$(parse_window_args "$@")"
+  while IFS= read -r line; do
+    case "$line" in
+      WINDOWED=*|WIN_FROM=*|WIN_DUR=*|WIN_TO=*)
+        eval "$line"
+        ;;
     esac
-  done
-  if [[ "$WINDOWED" -eq 1 ]]; then
-    [[ -n "$WIN_FROM" && -n "$WIN_DUR" ]] || fatal "analyze: both --from and --dur are required in window mode"
-    WIN_TO="$(float_add "$WIN_FROM" "$WIN_DUR")"
-  fi
+  done <<< "$win_info"
 
   local filelist
   filelist=$(mktemp)
@@ -224,12 +286,12 @@ cmd_analyze() {
 
     local include=1
     if [[ "$WINDOWED" -eq 1 ]]; then
-      # Check overlap of [t0, t1) with [WIN_FROM, WIN_TO)
-      local os oe od
-      os=$(float_max "$t0" "$WIN_FROM")
-      oe=$(float_min "$t1" "$WIN_TO")
-      od=$(float_sub "$oe" "$os")
-      if ! float_gt "$od" "0.000001"; then
+      local overlap_info HAS_OVERLAP
+      overlap_info="$(calculate_window_overlap "$t0" "$t1" "$WIN_FROM" "$WIN_TO")"
+      while IFS= read -r line; do
+        [[ "$line" =~ ^HAS_OVERLAP= ]] && eval "$line"
+      done <<< "$overlap_info"
+      if [[ "$HAS_OVERLAP" != "1" ]]; then
         include=0
       fi
     fi
@@ -238,14 +300,34 @@ cmd_analyze() {
       any_included=1
       local base trf
       base=$(basename "$f")
-      trf="${work}/${TRF_DIRNAME}/${base%.*}.trf"
+      
+      if [[ "$WINDOWED" -eq 1 ]]; then
+        # Window mode: create unique .trf name for this window
+        local win_suffix
+        win_suffix=$(printf "_w%.0f_%.0f" "$WIN_FROM" "$WIN_DUR")
+        trf="${work}/${TRF_DIRNAME}/${base%.*}${win_suffix}.trf"
+      else
+        # Full mode: standard .trf name
+        trf="${work}/${TRF_DIRNAME}/${base%.*}.trf"
+      fi
 
       if [[ ! -s "${trf}" || "${FORCE}" == "1" ]]; then
-        ffmpeg -hide_banner -nostdin -stats -loglevel info -progress pipe:2 \
-          -fflags +genpts+discardcorrupt -err_detect ignore_err \
-          -i "$f" \
-          -vf "vidstabdetect=shakiness=${SHAKINESS}:accuracy=${ACCURACY}:result=${trf}" \
-          -f null - >/dev/null
+        if [[ "$WINDOWED" -eq 1 ]]; then
+          # Window mode: analyze only the overlapping part (FAST)
+          local overlap_info2 LOCAL_START OVERLAP_DUR
+          overlap_info2="$(calculate_window_overlap "$t0" "$t1" "$WIN_FROM" "$WIN_TO")"
+          while IFS= read -r line; do
+            case "$line" in
+              LOCAL_START=*|OVERLAP_DUR=*)
+                eval "$line"
+                ;;
+            esac
+          done <<< "$overlap_info2"
+          run_vidstabdetect_window "$f" "$trf" "$LOCAL_START" "$OVERLAP_DUR"
+        else
+          # Full mode: analyze entire file (SLOW but high quality)
+          run_vidstabdetect_full "$f" "$trf"
+        fi
       fi
 
       echo "${idx},${f},${trf},${dur},${t0},${t1}" >> "${plan_csv}"
@@ -275,7 +357,7 @@ cmd_analyze() {
   echo "]" >> "${plan_json}"
 
   if [[ "$WINDOWED" -eq 1 ]]; then
-    echo "Analyze complete (window mode: from=${WIN_FROM}s to=${WIN_TO}s, global timeline preserved)."
+    echo "Analyze complete (window mode, global timeline preserved)."
   else
     echo "Analyze complete (full timeline)."
   fi
@@ -346,7 +428,8 @@ build_render_graph() {
   fc+=";"
   for ((k=0;k<m;k++)); do fc+="[vv${k}][aa${k}]"; done
   fc+="concat=n=${m}:v=1:a=1[vcat][acat]"
-  fc+=";[vcat]scale=min(300\\,iw):-1[wm];[vcat][wm]overlay=W-w-24:H-h-24:format=auto[vout]"
+  # watermark: logo is extra input at index m
+  fc+=";[${m}:v]scale=min(300\\,iw):-1[wm];[vcat][wm]overlay=W-w-24:H-h-24:format=auto[vout]"
 
   printf 'FC=%q\n' "${fc}"
   printf 'VMAP=%q\n' "[vout]"
@@ -361,15 +444,21 @@ cmd_render() {
   [[ -f "${plan_csv}" ]] || fatal "Missing plan: ${plan_csv}"
   [[ -f "${LOGO}"     ]] || fatal "Missing LOGO: ${LOGO}"
 
-  local WINDOWED=0 WIN_FROM_S WIN_DUR_S
-  WIN_FROM_S=""; WIN_DUR_S=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --from) WIN_FROM_S="$(to_seconds "$2")"; WINDOWED=1; shift 2;;
-      --dur)  WIN_DUR_S="$(to_seconds "$2")";  WINDOWED=1; shift 2;;
-      *) fatal "Unknown arg for render: $1";;
+  # Parse window args using shared function
+  local WINDOWED WIN_FROM WIN_DUR WIN_TO
+  local win_info
+  win_info="$(parse_window_args "$@")"
+  while IFS= read -r line; do
+    case "$line" in
+      WINDOWED=*|WIN_FROM=*|WIN_DUR=*|WIN_TO=*)
+        eval "$line"
+        ;;
     esac
-  done
+  done <<< "$win_info"
+  
+  # Rename for compatibility with build_render_graph
+  local WIN_FROM_S="$WIN_FROM"
+  local WIN_DUR_S="$WIN_DUR"
 
   local graph
   graph="$(
@@ -408,13 +497,14 @@ cmd_render() {
 # =================== debug graph builders ===================
 
 # plan_debug.csv: index,file,transform,duration,start,end
-# start/end here are LOCAL offsets within each file fragment.
+# start/end here are GLOBAL timeline coordinates (like analyze/render)
 
 build_debug_split_graph() {
-  local files=() trfs=() starts=() durs=()
+  # Expects WIN_FROM_G and WIN_TO_G to be set in environment
+  local files=() trfs=() file_starts=() file_ends=()
   while IFS=, read -r index file trf dur start end; do
     [[ "$index" == "index" ]] && continue
-    files+=("$file"); trfs+=("$trf"); durs+=("$dur"); starts+=("$start")
+    files+=("$file"); trfs+=("$trf"); file_starts+=("$start"); file_ends+=("$end")
   done
   local m="${#files[@]}"; [[ "$m" -ge 1 ]] || fatal "Empty debug plan"
 
@@ -429,22 +519,34 @@ build_debug_split_graph() {
   local fc=""
   for ((k=0;k<m;k++)); do
     local trf="${trfs[$k]}"
-    local ss="${starts[$k]}"
-    local dd="${durs[$k]}"
+    local fstart="${file_starts[$k]}"
+    local fend="${file_ends[$k]}"
+    
+    # Calculate overlap with window using shared function
+    local overlap_info LOCAL_START OVERLAP_DUR
+    overlap_info="$(calculate_window_overlap "$fstart" "$fend" "${WIN_FROM_G}" "${WIN_TO_G}")"
+    while IFS= read -r line; do
+      case "$line" in
+        LOCAL_START=*|OVERLAP_DUR=*)
+          eval "$line"
+          ;;
+      esac
+    done <<< "$overlap_info"
 
-    local ochain; ochain="$(filter_orig_chain "${ss}" "${dd}")"
-    local schain="trim=start=${ss}:duration=${dd},setpts=PTS-STARTPTS,$(filter_stab_chain "${trf}")"
+    local ochain; ochain="$(filter_orig_chain "${LOCAL_START}" "${OVERLAP_DUR}")"
+    local schain="trim=start=${LOCAL_START}:duration=${OVERLAP_DUR},setpts=PTS-STARTPTS,$(filter_stab_chain "${trf}")"
 
     fc+="${fc:+;}[${k}:v]${ochain}[olv${k}];"
     fc+="[${k}:v]${schain}[srv${k}];"
     fc+="[olv${k}][srv${k}]hstack=shortest=1[v${k}];"
-    fc+="[${k}:a]atrim=start=${ss}:duration=${dd},asetpts=PTS-STARTPTS,aformat=channel_layouts=mono,aresample=48000[a${k}]"
+    fc+="[${k}:a]atrim=start=${LOCAL_START}:duration=${OVERLAP_DUR},asetpts=PTS-STARTPTS,aformat=channel_layouts=mono,aresample=48000[a${k}]"
   done
 
   fc+=";"
   for ((k=0;k<m;k++)); do fc+="[v${k}][a${k}]"; done
   fc+="concat=n=${m}:v=1:a=1[vcat][acat]"
-  fc+=";[vcat]scale=min(300\\,iw):-1[wm];[vcat][wm]overlay=W-w-24:H-h-24:format=auto[vout]"
+  # watermark: logo is extra input at index m
+  fc+=";[${m}:v]scale=min(300\\,iw):-1[wm];[vcat][wm]overlay=W-w-24:H-h-24:format=auto[vout]"
 
   printf 'FC=%q\n' "${fc}"
   printf 'VMAP=%q\n' "[vout]"
@@ -452,10 +554,11 @@ build_debug_split_graph() {
 }
 
 build_debug_orig_graph() {
-  local files=() starts=() durs=()
+  # Expects WIN_FROM_G and WIN_TO_G to be set in environment
+  local files=() file_starts=() file_ends=()
   while IFS=, read -r index file trf dur start end; do
     [[ "$index" == "index" ]] && continue
-    files+=("$file"); durs+=("$dur"); starts+=("$start")
+    files+=("$file"); file_starts+=("$start"); file_ends+=("$end")
   done
   local m="${#files[@]}"; [[ "$m" -ge 1 ]] || fatal "Empty debug plan"
 
@@ -468,10 +571,22 @@ build_debug_orig_graph() {
 
   local fc=""
   for ((k=0;k<m;k++)); do
-    local ss="${starts[$k]}"
-    local dd="${durs[$k]}"
-    local vchain; vchain="$(filter_orig_chain "${ss}" "${dd}")"
-    local achain="atrim=start=${ss}:duration=${dd},asetpts=PTS-STARTPTS,aformat=channel_layouts=mono,aresample=48000"
+    local fstart="${file_starts[$k]}"
+    local fend="${file_ends[$k]}"
+    
+    # Calculate overlap with window using shared function
+    local overlap_info LOCAL_START OVERLAP_DUR
+    overlap_info="$(calculate_window_overlap "$fstart" "$fend" "${WIN_FROM_G}" "${WIN_TO_G}")"
+    while IFS= read -r line; do
+      case "$line" in
+        LOCAL_START=*|OVERLAP_DUR=*)
+          eval "$line"
+          ;;
+      esac
+    done <<< "$overlap_info"
+    
+    local vchain; vchain="$(filter_orig_chain "${LOCAL_START}" "${OVERLAP_DUR}")"
+    local achain="atrim=start=${LOCAL_START}:duration=${OVERLAP_DUR},asetpts=PTS-STARTPTS,aformat=channel_layouts=mono,aresample=48000"
     fc+="${fc:+;}[${k}:v]${vchain}[v${k}];[${k}:a]${achain}[a${k}]"
   done
 
@@ -485,10 +600,11 @@ build_debug_orig_graph() {
 }
 
 build_debug_stab_graph() {
-  local files=() trfs=() starts=() durs=()
+  # Expects WIN_FROM_G and WIN_TO_G to be set in environment
+  local files=() trfs=() file_starts=() file_ends=()
   while IFS=, read -r index file trf dur start end; do
     [[ "$index" == "index" ]] && continue
-    files+=("$file"); trfs+=("$trf"); durs+=("$dur"); starts+=("$start")
+    files+=("$file"); trfs+=("$trf"); file_starts+=("$start"); file_ends+=("$end")
   done
   local m="${#files[@]}"; [[ "$m" -ge 1 ]] || fatal "Empty debug plan"
 
@@ -502,10 +618,22 @@ build_debug_stab_graph() {
   local fc=""
   for ((k=0;k<m;k++)); do
     local trf="${trfs[$k]}"
-    local ss="${starts[$k]}"
-    local dd="${durs[$k]}"
-    local vchain="trim=start=${ss}:duration=${dd},setpts=PTS-STARTPTS,$(filter_stab_chain "${trf}")"
-    local achain="atrim=start=${ss}:duration=${dd},asetpts=PTS-STARTPTS,aformat=channel_layouts=mono,aresample=48000"
+    local fstart="${file_starts[$k]}"
+    local fend="${file_ends[$k]}"
+    
+    # Calculate overlap with window using shared function
+    local overlap_info LOCAL_START OVERLAP_DUR
+    overlap_info="$(calculate_window_overlap "$fstart" "$fend" "${WIN_FROM_G}" "${WIN_TO_G}")"
+    while IFS= read -r line; do
+      case "$line" in
+        LOCAL_START=*|OVERLAP_DUR=*)
+          eval "$line"
+          ;;
+      esac
+    done <<< "$overlap_info"
+    
+    local vchain="trim=start=${LOCAL_START}:duration=${OVERLAP_DUR},setpts=PTS-STARTPTS,$(filter_stab_chain "${trf}")"
+    local achain="atrim=start=${LOCAL_START}:duration=${OVERLAP_DUR},asetpts=PTS-STARTPTS,aformat=channel_layouts=mono,aresample=48000"
     fc+="${fc:+;}[${k}:v]${vchain}[v${k}];[${k}:a]${achain}[a${k}]"
   done
 
@@ -522,22 +650,27 @@ build_debug_stab_graph() {
 cmd_debug() {
   local in_dir="$1" work="$2" split_out="$3"; shift 3
 
-  local from="00:00:00" dur="30"
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --from) from="$2"; shift 2;;
-      --dur)  dur="$2"; shift 2;;
-      *) fatal "Unknown arg for debug: $1";;
-    esac
-  done
-
   ensure_tools
   mkdir -p "${work}/${TRF_DIRNAME}"
 
-  local g_from g_dur g_to
-  g_from="$(to_seconds "$from")"
-  g_dur="$(to_seconds "$dur")"
-  g_to="$(float_add "$g_from" "$g_dur")"
+  # Parse window args (required for debug)
+  local WINDOWED WIN_FROM WIN_DUR WIN_TO
+  local win_info
+  win_info="$(parse_window_args "$@")"
+  while IFS= read -r line; do
+    case "$line" in
+      WINDOWED=*|WIN_FROM=*|WIN_DUR=*|WIN_TO=*)
+        eval "$line"
+        ;;
+    esac
+  done <<< "$win_info"
+  
+  # Debug requires window
+  [[ "$WINDOWED" -eq 1 ]] || fatal "debug: --from and --dur are required"
+  
+  local g_from="$WIN_FROM"
+  local g_dur="$WIN_DUR"
+  local g_to="$WIN_TO"
 
   local filelist
   filelist=$(mktemp)
@@ -559,27 +692,27 @@ cmd_debug() {
     dur_full=$(to_seconds "${dur_full}")
     t1=$(float_add "$t0" "$dur_full")
 
-    local os oe od
-    os=$(float_max "$t0" "$g_from")
-    oe=$(float_min "$t1" "$g_to")
-    od=$(float_sub "$oe" "$os")
+    # Check overlap with debug window
+    local overlap_info HAS_OVERLAP LOCAL_START OVERLAP_DUR
+    overlap_info="$(calculate_window_overlap "$t0" "$t1" "$g_from" "$g_to")"
+    while IFS= read -r line; do
+      case "$line" in
+        HAS_OVERLAP=*|LOCAL_START=*|OVERLAP_DUR=*)
+          eval "$line"
+          ;;
+      esac
+    done <<< "$overlap_info"
 
-    if float_gt "$od" "0.000001"; then
-      local base trf local_start local_end
+    if [[ "$HAS_OVERLAP" == "1" ]]; then
+      local base trf
       base=$(basename "$f")
       trf="${work}/${TRF_DIRNAME}/${base%.*}.debug.trf"
 
-      local_start=$(float_sub "$os" "$t0")
+      # Analyze ONLY the window (FAST for debug)
+      run_vidstabdetect_window "$f" "$trf" "$LOCAL_START" "$OVERLAP_DUR"
 
-      ffmpeg -hide_banner -nostdin -stats -loglevel info -progress pipe:2 \
-        -fflags +genpts+discardcorrupt -err_detect ignore_err \
-        -ss "${local_start}" -t "${od}" \
-        -i "$f" \
-        -vf "vidstabdetect=shakiness=${SHAKINESS}:accuracy=${ACCURACY}:result=${trf}" \
-        -f null - >/dev/null
-
-      local_end=$(float_add "${local_start}" "${od}")
-      echo "${idx},${f},${trf},${od},${local_start},${local_end}" >> "${plan_csv}"
+      # Store with GLOBAL timeline coordinates
+      echo "${idx},${f},${trf},${dur_full},${t0},${t1}" >> "${plan_csv}"
       idx=$((idx+1))
     fi
 
@@ -604,7 +737,7 @@ cmd_debug() {
 
   # 1) Split-screen
   local graph_s
-  graph_s="$(build_debug_split_graph < "${plan_csv}")"
+  graph_s="$(WIN_FROM_G="$g_from" WIN_TO_G="$g_to" build_debug_split_graph < "${plan_csv}")"
 
   local IARGS="" WATERMARK_INPUT="" FC="" VMAP="" AMAP=""
   while IFS= read -r line; do
@@ -634,7 +767,7 @@ cmd_debug() {
 
   # 2) Original-only
   local graph_o
-  graph_o="$(build_debug_orig_graph < "${plan_csv}")"
+  graph_o="$(WIN_FROM_G="$g_from" WIN_TO_G="$g_to" build_debug_orig_graph < "${plan_csv}")"
 
   IARGS=""; FC=""; VMAP=""; AMAP=""
   while IFS= read -r line; do
@@ -664,7 +797,7 @@ cmd_debug() {
 
   # 3) Stabilized-only
   local graph_t
-  graph_t="$(build_debug_stab_graph < "${plan_csv}")"
+  graph_t="$(WIN_FROM_G="$g_from" WIN_TO_G="$g_to" build_debug_stab_graph < "${plan_csv}")"
 
   IARGS=""; FC=""; VMAP=""; AMAP=""
   while IFS= read -r line; do

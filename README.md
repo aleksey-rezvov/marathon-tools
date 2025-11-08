@@ -16,7 +16,7 @@ All code and comments in the script are in English.
 - `SHAKINESS` — `vidstabdetect` shakiness, 1–10 (default: `10`)
 - `ACCURACY` — `vidstabdetect` accuracy, 1–15 (default: `15`)
 - `SMOOTH` — `vidstabtransform` smoothing, typical 25–40 (default: `35`)
-- `ZOOM` — stabilization zoom to hide borders (default: `5`)
+- `ZOOM` — stabilization zoom to hide borders (default: `1`)
 - `UNSHARP` — sharpening filter (default: `5:5:0.8:3:3:0.4`)
 - `SCALE` — output size, e.g. `1920:-2`, empty = keep source
 - `CODEC` — `h264` or `h265` (default: `h264`)
@@ -34,17 +34,19 @@ All code and comments in the script are in English.
 
 ### Full timeline (one-time before final render)
 
+Analyzes **entire files** (slow but high quality):
+
 ```
 ./marathon_render.sh analyze \
   "/media/arezvov/2004-1014/VIDEO" \
   "/media/arezvov/arezvov_more/video/istanbul_marathon_2025/work"
 ```
 
-### Windowed analyze (quick test area, lighter than full)
+Creates `.trf` files for full files.
 
-Builds plan only for a global window, timeline starts at `0` in that window.
+### Windowed analyze (quick test, fast)
 
-Example: from `00:30:00` for `300` seconds:
+Analyzes **only the specified window** (fast):
 
 ```
 ./marathon_render.sh analyze \
@@ -53,6 +55,8 @@ Example: from `00:30:00` for `300` seconds:
   --from 00:30:00 \
   --dur 300
 ```
+
+Creates window-specific `.trf` files (e.g., `file_w1800_300.trf`). These can only be used with `render` for the **same window**.
 
 ---
 
@@ -86,13 +90,14 @@ Example: `00:30:00` + `300s` from the global timeline:
 
 ## 3. Debug (per-window tuning)
 
-For a given global window:
+Fast stabilization quality check on a small window. Analyzes **only the window** (like windowed analyze).
 
+Produces three outputs:
 - `*_split.mp4` — left: original, right: stabilized, with watermark.
 - `*_split_orig.mp4` — original-only window.
-- `*_split_stab.mp4` — stabilized-only window (same filters + watermark as `render`).
+- `*_split_stab.mp4` — stabilized-only window (same filters as `render`).
 
-Example (your paths): 10s from `00:31:00`:
+Example: 10s from `00:31:00`:
 
 ```
 LOGO="/home/arezvov/Pictures/funkcio-title.png" \
@@ -104,4 +109,4 @@ LOGO="/home/arezvov/Pictures/funkcio-title.png" \
   --dur 10
 ```
 
-Use `debug` to dial in `SMOOTH`, `ZOOM`, `UNSHARP`, `CRF`, then run full `analyze` → `render`.
+Creates `.debug.trf` files (separate from analyze). Use `debug` to dial in `SMOOTH`, `ZOOM`, `UNSHARP`, then run full `analyze` → `render`.
