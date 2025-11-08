@@ -36,7 +36,7 @@ All code and comments in the script are in English.
 
 Analyzes **entire files** (slow but high quality):
 
-```
+```bash
 ./marathon_render.sh analyze \
   "/media/arezvov/2004-1014/VIDEO" \
   "/media/arezvov/arezvov_more/video/istanbul_marathon_2025/work"
@@ -48,7 +48,7 @@ Creates `.trf` files for full files.
 
 Analyzes **only the specified window** (fast):
 
-```
+```bash
 ./marathon_render.sh analyze \
   "/media/arezvov/2004-1014/VIDEO" \
   "/media/arezvov/arezvov_more/video/istanbul_marathon_2025/work_window_30m_5m" \
@@ -66,7 +66,7 @@ Uses `PLAN_CSV` in `work_dir` created by `analyze`.
 
 ### Full marathon, H.264
 
-```
+```bash
 LOGO="/home/arezvov/Pictures/funkcio-title.png" \
 CRF_H264=22 PRESET=slow SCALE=1920:-2 \
 ./marathon_render.sh render \
@@ -78,7 +78,7 @@ CRF_H264=22 PRESET=slow SCALE=1920:-2 \
 
 Example: `00:30:00` + `300s` from the global timeline:
 
-```
+```bash
 ./marathon_render.sh render \
   "/media/arezvov/arezvov_more/video/istanbul_marathon_2025/work" \
   "/media/arezvov/arezvov_more/video/istanbul_marathon_2025/marathon_30m_5m.mp4" \
@@ -93,13 +93,14 @@ Example: `00:30:00` + `300s` from the global timeline:
 Fast stabilization quality check on a small window. Analyzes **only the window** (like windowed analyze).
 
 Produces three outputs:
+
 - `*_split.mp4` — left: original, right: stabilized, with watermark.
 - `*_split_orig.mp4` — original-only window.
 - `*_split_stab.mp4` — stabilized-only window (same filters as `render`).
 
 Example: 10s from `00:31:00`:
 
-```
+```bash
 LOGO="/home/arezvov/Pictures/funkcio-title.png" \
 ./marathon_render.sh debug \
   "/media/arezvov/2004-1014/VIDEO" \
